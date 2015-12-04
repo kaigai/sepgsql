@@ -186,8 +186,7 @@ clamp_row_est(double nrows)
  */
 void
 cost_seqscan(Path *path, PlannerInfo *root,
-			 RelOptInfo *baserel, ParamPathInfo *param_info,
-			 int nworkers)
+			 RelOptInfo *baserel, ParamPathInfo *param_info)
 {
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
@@ -232,8 +231,8 @@ cost_seqscan(Path *path, PlannerInfo *root,
 	 * This is almost certainly not exactly the right way to model this, so
 	 * this will probably need to be changed at some point...
 	 */
-	if (nworkers > 0)
-		run_cost = run_cost / (nworkers + 0.5);
+	if (path->parallel_degree > 0)
+		run_cost = run_cost / (path->parallel_degree + 0.5);
 
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;

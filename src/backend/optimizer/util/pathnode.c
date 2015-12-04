@@ -685,6 +685,151 @@ add_path_precheck(RelOptInfo *parent_rel,
 	return true;
 }
 
+/*
+ * add_partial_path
+ *	  Like add_path, our goal here is to consider whether a path is worthy
+ *	  of being kept around, but the considerations here are a bit different.
+ *	  A partial path is one which can be executed in any number of workers in
+ *	  parallel such that each worker will generate a subset of the path's
+ *	  overall result.
+ *
+ *	  We don't generate parameterized partial paths because they seem unlikely
+ *	  ever to be worthwhile.  The only way we could ever use such a path is
+ *	  by executing a nested loop with a complete path on the outer side - thus,
+ *	  each worker would scan the entire outer relation - and the partial path
+ *	  on the inner side - thus, each worker would scan only part of the inner
+ *	  relation.  This is silly: a parameterized path is generally going to be
+ *	  based on an index scan, and we can't generate a partial path for that.
+ *	  And it's generally only going to produce a few rows, so splitting them
+ *	  up between workers doesn't really make sense.  It would be better to
+ *	  use an unparameterized partial path on the outer side of the join with
+ *	  a parameterized complete path on the inner side in virtually every case.
+ *
+ *	  Because we don't need to consider parameterized paths here, we also don't
+ *	  need to consider the row counts as a measure of quality: every path will
+ *	  produce the same number of rows.  Neither do we need to consider startup
+ *	  costs: parallelism is only used for plans that will be run to completion.
+ *	  Therefore, this routine is much simpler than add_path: it needs to
+ *	  consider only pathkeys and total cost.
+ */
+void
+add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	bool		accept_new = true;		/* unless we find a superior old path */
+	ListCell   *insert_after = NULL;	/* where to insert new item */
+	ListCell   *p1;
+	ListCell   *p1_prev;
+	ListCell   *p1_next;
+
+	/* Check for query cancel. */
+	CHECK_FOR_INTERRUPTS();
+
+	/*
+	 * As in add_path, throw out any paths which are dominated by the new path,
+	 * but throw out the new path if some existing path dominates it.
+	 */
+	p1_prev = NULL;
+	for (p1 = list_head(parent_rel->partial_pathlist); p1 != NULL;
+		 p1 = p1_next)
+	{
+		Path	   *old_path = (Path *) lfirst(p1);
+		bool		remove_old = false; /* unless new proves superior */
+		PathKeysComparison keyscmp;
+
+		p1_next = lnext(p1);
+
+		/* Compare pathkeys. */
+		keyscmp = compare_pathkeys(new_path->pathkeys, old_path->pathkeys);
+
+		/* Unless pathkeys are incompable, keep just one of the two paths. */
+		if (keyscmp != PATHKEYS_DIFFERENT)
+		{
+			if (new_path->total_cost > old_path->total_cost * STD_FUZZ_FACTOR)
+			{
+				/* New path costs more; keep it only if pathkeys are better. */
+				if (keyscmp != PATHKEYS_BETTER1)
+					accept_new = false;
+			}
+			else if (old_path->total_cost > new_path->total_cost
+						* STD_FUZZ_FACTOR)
+			{
+				/* Old path costs more; keep it only if pathkeys are better. */
+				if (keyscmp != PATHKEYS_BETTER2)
+					remove_old = true;
+			}
+			else if (keyscmp == PATHKEYS_BETTER1)
+			{
+				/* Costs are about the same, new path has better pathkeys. */
+				remove_old = true;
+			}
+			else if (keyscmp == PATHKEYS_BETTER2)
+			{
+				/* Costs are about the same, old path has better pathkeys. */
+				accept_new = false;
+			}
+			else if (old_path->total_cost > new_path->total_cost * 1.0000000001)
+			{
+				/* Pathkeys are the same, and the old path costs more. */
+				remove_old = true;
+			}
+			else
+			{
+				/*
+				 * Pathkeys are the same, and new path isn't materially
+				 * cheaper.
+				 */
+				accept_new = false;
+			}
+		}
+
+		/*
+		 * Remove current element from partial_pathlist if dominated by new.
+		 */
+		if (remove_old)
+		{
+			parent_rel->partial_pathlist =
+				list_delete_cell(parent_rel->partial_pathlist, p1, p1_prev);
+			/* add_path has a special case for IndexPath; we don't need it */
+			Assert(!IsA(old_path, IndexPath));
+			pfree(old_path);
+			/* p1_prev does not advance */
+		}
+		else
+		{
+			/* new belongs after this old path if it has cost >= old's */
+			if (new_path->total_cost >= old_path->total_cost)
+				insert_after = p1;
+			/* p1_prev advances */
+			p1_prev = p1;
+		}
+
+		/*
+		 * If we found an old path that dominates new_path, we can quit
+		 * scanning the partial_pathlist; we will not add new_path, and we
+		 * assume new_path cannot dominate any later path.
+		 */
+		if (!accept_new)
+			break;
+	}
+
+	if (accept_new)
+	{
+		/* Accept the new path: insert it at proper place */
+		if (insert_after)
+			lappend_cell(parent_rel->partial_pathlist, insert_after, new_path);
+		else
+			parent_rel->partial_pathlist =
+				lcons(new_path, parent_rel->partial_pathlist);
+	}
+	else
+	{
+		/* add_path has a special case for IndexPath; we don't need it */
+		Assert(!IsA(new_path, IndexPath));
+		/* Reject and recycle the new path */
+		pfree(new_path);
+	}
+}
+
 
 /*****************************************************************************
  *		PATH NODE CREATION ROUTINES
@@ -697,7 +842,7 @@ add_path_precheck(RelOptInfo *parent_rel,
  */
 Path *
 create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
-					Relids required_outer, int nworkers)
+					Relids required_outer, int parallel_degree)
 {
 	Path	   *pathnode = makeNode(Path);
 
@@ -705,10 +850,11 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->parent = rel;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
-	pathnode->parallel_aware = nworkers > 0 ? true : false;
+	pathnode->parallel_aware = parallel_degree > 0 ? true : false;
+	pathnode->parallel_degree = parallel_degree;
 	pathnode->pathkeys = NIL;	/* seqscan has unordered result */
 
-	cost_seqscan(pathnode, root, rel, pathnode->param_info, nworkers);
+	cost_seqscan(pathnode, root, rel, pathnode->param_info);
 
 	return pathnode;
 }
@@ -727,6 +873,7 @@ create_samplescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
+	pathnode->parallel_degree = 0;
 	pathnode->pathkeys = NIL;	/* samplescan has unordered result */
 
 	cost_samplescan(pathnode, root, rel, pathnode->param_info);
@@ -781,6 +928,7 @@ create_index_path(PlannerInfo *root,
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = pathkeys;
 
 	/* Convert clauses to indexquals the executor can handle */
@@ -827,6 +975,7 @@ create_bitmap_heap_path(PlannerInfo *root,
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = NIL;		/* always unordered */
 
 	pathnode->bitmapqual = bitmapqual;
@@ -853,6 +1002,7 @@ create_bitmap_and_path(PlannerInfo *root,
 	pathnode->path.parent = rel;
 	pathnode->path.param_info = NULL;	/* not used in bitmap trees */
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = NIL;		/* always unordered */
 
 	pathnode->bitmapquals = bitmapquals;
@@ -878,6 +1028,7 @@ create_bitmap_or_path(PlannerInfo *root,
 	pathnode->path.parent = rel;
 	pathnode->path.param_info = NULL;	/* not used in bitmap trees */
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = NIL;		/* always unordered */
 
 	pathnode->bitmapquals = bitmapquals;
@@ -903,6 +1054,7 @@ create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = NIL;		/* always unordered */
 
 	pathnode->tidquals = tidquals;
@@ -921,7 +1073,8 @@ create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
  * Note that we must handle subpaths = NIL, representing a dummy access path.
  */
 AppendPath *
-create_append_path(RelOptInfo *rel, List *subpaths, Relids required_outer)
+create_append_path(RelOptInfo *rel, List *subpaths, Relids required_outer,
+				   int parallel_degree)
 {
 	AppendPath *pathnode = makeNode(AppendPath);
 	ListCell   *l;
@@ -931,6 +1084,7 @@ create_append_path(RelOptInfo *rel, List *subpaths, Relids required_outer)
 	pathnode->path.param_info = get_appendrel_parampathinfo(rel,
 															required_outer);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = parallel_degree;
 	pathnode->path.pathkeys = NIL;		/* result is always considered
 										 * unsorted */
 	pathnode->subpaths = subpaths;
@@ -985,6 +1139,7 @@ create_merge_append_path(PlannerInfo *root,
 	pathnode->path.param_info = get_appendrel_parampathinfo(rel,
 															required_outer);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->subpaths = subpaths;
 
@@ -1060,6 +1215,7 @@ create_result_path(List *quals)
 	pathnode->path.parent = NULL;
 	pathnode->path.param_info = NULL;	/* there are no other rels... */
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = NIL;
 	pathnode->quals = quals;
 
@@ -1094,6 +1250,7 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 	pathnode->path.parent = rel;
 	pathnode->path.param_info = subpath->param_info;
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = subpath->pathkeys;
 
 	pathnode->subpath = subpath;
@@ -1155,6 +1312,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.parent = rel;
 	pathnode->path.param_info = subpath->param_info;
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 
 	/*
 	 * Assume the output is unsorted, since we don't necessarily have pathkeys
@@ -1328,7 +1486,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
  */
 GatherPath *
 create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
-				   Relids required_outer, int nworkers)
+				   Relids required_outer)
 {
 	GatherPath *pathnode = makeNode(GatherPath);
 
@@ -1336,11 +1494,18 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.parent = rel;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
-	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = subpath->parallel_degree;
 	pathnode->path.pathkeys = NIL;		/* Gather has unordered result */
 
 	pathnode->subpath = subpath;
-	pathnode->num_workers = nworkers;
+	pathnode->single_copy = false;
+
+	if (pathnode->path.parallel_degree == 0)
+	{
+		pathnode->path.parallel_degree = 1;
+		pathnode->path.pathkeys = subpath->pathkeys;
+		pathnode->single_copy = true;
+	}
 
 	cost_gather(pathnode, root, rel, pathnode->path.param_info);
 
@@ -1393,6 +1558,7 @@ create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
+	pathnode->parallel_degree = 0;
 	pathnode->pathkeys = pathkeys;
 
 	cost_subqueryscan(pathnode, root, rel, pathnode->param_info);
@@ -1416,6 +1582,7 @@ create_functionscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
+	pathnode->parallel_degree = 0;
 	pathnode->pathkeys = pathkeys;
 
 	cost_functionscan(pathnode, root, rel, pathnode->param_info);
@@ -1439,6 +1606,7 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
+	pathnode->parallel_degree = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
 	cost_valuesscan(pathnode, root, rel, pathnode->param_info);
@@ -1461,6 +1629,7 @@ create_ctescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
+	pathnode->parallel_degree = 0;
 	pathnode->pathkeys = NIL;	/* XXX for now, result is always unordered */
 
 	cost_ctescan(pathnode, root, rel, pathnode->param_info);
@@ -1484,6 +1653,7 @@ create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
+	pathnode->parallel_degree = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
 	/* Cost is the same as for a regular CTE scan */
@@ -1516,6 +1686,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.rows = rows;
 	pathnode->path.startup_cost = startup_cost;
 	pathnode->path.total_cost = total_cost;
@@ -1651,6 +1822,7 @@ create_nestloop_path(PlannerInfo *root,
 								  required_outer,
 								  &restrict_clauses);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_degree = 0;
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->jointype = jointype;
 	pathnode->outerjoinpath = outer_path;
@@ -1709,6 +1881,7 @@ create_mergejoin_path(PlannerInfo *root,
 								  required_outer,
 								  &restrict_clauses);
 	pathnode->jpath.path.parallel_aware = false;
+	pathnode->jpath.path.parallel_degree = 0;
 	pathnode->jpath.path.pathkeys = pathkeys;
 	pathnode->jpath.jointype = jointype;
 	pathnode->jpath.outerjoinpath = outer_path;
@@ -1766,6 +1939,7 @@ create_hashjoin_path(PlannerInfo *root,
 								  required_outer,
 								  &restrict_clauses);
 	pathnode->jpath.path.parallel_aware = false;
+	pathnode->jpath.path.parallel_degree = 0;
 
 	/*
 	 * A hashjoin never has pathkeys, since its output ordering is
