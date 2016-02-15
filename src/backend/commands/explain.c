@@ -28,6 +28,7 @@
 #include "rewrite/rewriteHandler.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/custom.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"

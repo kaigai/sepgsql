@@ -41,6 +41,7 @@
 #include "optimizer/var.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
+#include "utils/custom.h"
 #include "utils/lsyscache.h"
 
 

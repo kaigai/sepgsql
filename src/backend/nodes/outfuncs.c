@@ -29,6 +29,7 @@
 #include "nodes/extensible.h"
 #include "nodes/plannodes.h"
 #include "nodes/relation.h"
+#include "utils/custom.h"
 #include "utils/datum.h"
 
 
@@ -630,11 +631,9 @@ _outCustomScan(StringInfo str, const CustomScan *node)
 	WRITE_NODE_FIELD(custom_private);
 	WRITE_NODE_FIELD(custom_scan_tlist);
 	WRITE_BITMAPSET_FIELD(custom_relids);
-	/* Dump library and symbol name instead of raw pointer */
+	/* Dump the name of CustomScanMethods instead of raw pointer */
 	appendStringInfoString(str, " :methods ");
-	_outToken(str, node->methods->LibraryName);
-	appendStringInfoChar(str, ' ');
-	_outToken(str, node->methods->SymbolName);
+	_outToken(str, node->methods->CustomName);
 }
 
 static void

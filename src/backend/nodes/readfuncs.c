@@ -33,7 +33,7 @@
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
 #include "nodes/readfuncs.h"
-
+#include "utils/custom.h"
 
 /*
  * Macros to simplify reading of different kinds of fields.  Use these
@@ -1824,9 +1824,7 @@ static CustomScan *
 _readCustomScan(void)
 {
 	READ_LOCALS(CustomScan);
-	char	   *library_name;
-	char	   *symbol_name;
-	const CustomScanMethods *methods;
+	char	   *custom_name;
 
 	ReadCommonScan(&local_node->scan);
 
@@ -1842,15 +1840,8 @@ _readCustomScan(void)
 	 */
 	token = pg_strtok(&length);		/* skip methods: */
 	token = pg_strtok(&length);		/* LibraryName */
-	library_name = nullable_string(token, length);
-	token = pg_strtok(&length);		/* SymbolName */
-	symbol_name = nullable_string(token, length);
-
-	methods = (const CustomScanMethods *)
-		load_external_function(library_name, symbol_name, true, NULL);
-	Assert(strcmp(methods->LibraryName, library_name) == 0 &&
-		   strcmp(methods->SymbolName, symbol_name) == 0);
-	local_node->methods = methods;
+	custom_name = nullable_string(token, length);
+	local_node->methods = GetCustomScanMethods(custom_name, false);
 
 	READ_DONE();
 }
