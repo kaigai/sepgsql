@@ -144,6 +144,10 @@ typedef struct CustomExecMethods
 	void		(*ExplainCustomScan) (CustomScanState *node,
 												  List *ancestors,
 												  ExplainState *es);
+
+	/* Optional: special optimization if CustomScan under LIMIT node */
+	void		(*PassDownLimitBound) (CustomScanState *node,
+									   LimitState *lstate);
 } CustomExecMethods;
 
 extern void RegisterCustomScanMethods(const CustomScanMethods *methods);

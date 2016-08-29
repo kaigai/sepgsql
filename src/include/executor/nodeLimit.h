@@ -21,4 +21,6 @@ extern TupleTableSlot *ExecLimit(LimitState *node);
 extern void ExecEndLimit(LimitState *node);
 extern void ExecReScanLimit(LimitState *node);
 
+extern void pass_down_bound(LimitState *node, PlanState *child_node);
+
 #endif   /* NODELIMIT_H */

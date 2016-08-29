@@ -154,6 +154,8 @@ typedef void (*InitializeWorkerForeignScan_function) (ForeignScanState *node,
 typedef bool (*IsForeignScanParallelSafe_function) (PlannerInfo *root,
 															 RelOptInfo *rel,
 														 RangeTblEntry *rte);
+typedef void (*PassDownLimitBound_function) (ForeignScanState *node,
+											 LimitState *lstate);
 
 /*
  * FdwRoutine is the struct returned by a foreign-data wrapper's handler
@@ -224,6 +226,9 @@ typedef struct FdwRoutine
 	EstimateDSMForeignScan_function EstimateDSMForeignScan;
 	InitializeDSMForeignScan_function InitializeDSMForeignScan;
 	InitializeWorkerForeignScan_function InitializeWorkerForeignScan;
+
+	/* Special optimization function if ForeignScan under LIMIT */
+	PassDownLimitBound_function PassDownLimitBound;
 } FdwRoutine;
 
 

@@ -23,11 +23,11 @@
 
 #include "executor/executor.h"
 #include "executor/nodeLimit.h"
+#include "foreign/fdwapi.h"
+#include "nodes/extensible.h"
 #include "nodes/nodeFuncs.h"
 
 static void recompute_limits(LimitState *node);
-static void pass_down_bound(LimitState *node, PlanState *child_node);
-
 
 /* ----------------------------------------------------------------
  *		ExecLimit
@@ -315,7 +315,7 @@ recompute_limits(LimitState *node)
  * changes of these parameters.  If we ever do redesign this, it'd be a
  * good idea to integrate this signaling with the parameter-change mechanism.
  */
-static void
+void
 pass_down_bound(LimitState *node, PlanState *child_node)
 {
 	if (IsA(child_node, SortState))
@@ -359,6 +359,20 @@ pass_down_bound(LimitState *node, PlanState *child_node)
 		if (outerPlanState(child_node) &&
 			!expression_returns_set((Node *) child_node->plan->targetlist))
 			pass_down_bound(node, outerPlanState(child_node));
+	}
+	else if (IsA(child_node, ForeignScanState))
+	{
+		ForeignScanState   *fss = (ForeignScanState *) child_node;
+
+		if (fss->fdwroutine->PassDownLimitBound)
+			fss->fdwroutine->PassDownLimitBound(fss, node);
+	}
+	else if (IsA(child_node, CustomScanState))
+	{
+		CustomScanState	   *css = (CustomScanState *) child_node;
+
+		if (css->methods->PassDownLimitBound)
+			css->methods->PassDownLimitBound(css, node);
 	}
 }
 

@@ -350,6 +350,17 @@ void (*ExplainCustomScan) (CustomScanState *node,
     be shown even without this callback, but the callback allows the display
     of additional, private state.
    </para>
+
+   <para>
+<programlisting>
+void  (*PassDownLimitBound) (CustomScanState *node,
+                             LimitState *lstate);
+</programlisting>
+    Allows special optimization if <structname>CustomScanState</> is located
+    under <command>LimitState</> thus we can preliminary know exact number of
+    rows to be produced.
+    This callback is optional.
+   </para>
   </sect2>
  </sect1>
 </chapter>

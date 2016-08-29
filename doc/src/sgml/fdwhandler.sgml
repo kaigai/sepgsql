@@ -1256,6 +1256,24 @@ InitializeWorkerForeignScan(ForeignScanState *node, shm_toc *toc,
    </para>
    </sect2>
 
+   <sect2 id="fdw-callbacks-misc">
+    <title>FDW Routines for Miscellaneous Purpose</title>
+    <para>
+     A <structname>ForeignScan</> node also has miscellaneous callbacks for
+     corner case optimization and so on.
+    </para>
+
+    <para>
+<programlisting>
+void
+PassDownLimitBound(ForeignScanState *node, LimitState *lstate);
+</programlisting>
+     Allows special optimization if <structname>ForeignScanState</> is located
+     under <command>LimitState</> thus we can preliminary know exact number of
+     rows to be produced.
+     This callback is optional.
+    </para>
+   </sect2>
    </sect1>
 
    <sect1 id="fdw-helpers">
